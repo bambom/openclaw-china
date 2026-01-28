@@ -7,6 +7,8 @@
 import type { DingtalkRawMessage, DingtalkMessageContext } from "./types.js";
 import type { DingtalkConfig } from "./config.js";
 import { getDingtalkRuntime, isDingtalkRuntimeInitialized } from "./runtime.js";
+import { sendMessageDingtalk } from "./send.js";
+import { sendMediaDingtalk } from "./media.js";
 
 /**
  * 策略检查结果
@@ -350,6 +352,11 @@ export async function handleDingtalkMessage(params: {
       log(`[dingtalk] core.channel.reply.dispatchReplyFromConfig not available, skipping dispatch`);
       return;
     }
+
+    if (!core.channel?.reply?.createReplyDispatcher && !core.channel?.reply?.createReplyDispatcherWithTyping) {
+      log(`[dingtalk] core.channel.reply dispatcher factory not available, skipping dispatch`);
+      return;
+    }
     
     // 解析路由
     const route = core.channel.routing.resolveAgentRoute({
@@ -363,20 +370,110 @@ export async function handleDingtalkMessage(params: {
     
     // 构建入站上下文
     const inboundCtx = buildInboundContext(ctx, route.sessionKey, route.accountId);
-    
+
     // 如果有 finalizeInboundContext，使用它
     const finalCtx = core.channel.reply.finalizeInboundContext
       ? core.channel.reply.finalizeInboundContext(inboundCtx)
       : inboundCtx;
-    
+
+    const dingtalkCfg = channelCfg;
+    if (!dingtalkCfg) {
+      log(`[dingtalk] channel config missing, skipping dispatch`);
+      return;
+    }
+
+    const textApi = core.channel?.text;
+    const textChunkLimit =
+      textApi?.resolveTextChunkLimit?.({
+        cfg,
+        channel: "dingtalk",
+        defaultLimit: dingtalkCfg.textChunkLimit ?? 4000,
+      }) ?? (dingtalkCfg.textChunkLimit ?? 4000);
+    const chunkMode = textApi?.resolveChunkMode?.(cfg, "dingtalk");
+    const tableMode = textApi?.resolveMarkdownTableMode?.({ cfg, channel: "dingtalk" });
+
+    const deliver = async (payload: { text?: string; mediaUrl?: string; mediaUrls?: string[] }) => {
+      const targetId = isGroup ? ctx.conversationId : ctx.senderId;
+      const chatType = isGroup ? "group" : "direct";
+
+      const mediaUrls = payload.mediaUrls ?? (payload.mediaUrl ? [payload.mediaUrl] : []);
+      if (mediaUrls.length > 0) {
+        for (const mediaUrl of mediaUrls) {
+          await sendMediaDingtalk({
+            cfg: dingtalkCfg,
+            to: targetId,
+            mediaUrl,
+            chatType,
+          });
+        }
+        return;
+      }
+
+      const rawText = payload.text ?? "";
+      if (!rawText.trim()) return;
+      const converted = textApi?.convertMarkdownTables
+        ? textApi.convertMarkdownTables(rawText, tableMode)
+        : rawText;
+      const chunks =
+        textApi?.chunkTextWithMode && typeof textChunkLimit === "number" && textChunkLimit > 0
+          ? textApi.chunkTextWithMode(converted, textChunkLimit, chunkMode)
+          : [converted];
+
+      for (const chunk of chunks) {
+        await sendMessageDingtalk({
+          cfg: dingtalkCfg,
+          to: targetId,
+          text: chunk,
+          chatType,
+        });
+      }
+    };
+
+    const humanDelay = core.channel.reply.resolveHumanDelayConfig
+      ? core.channel.reply.resolveHumanDelayConfig(cfg, route.agentId)
+      : undefined;
+
+    const dispatcherResult = core.channel.reply.createReplyDispatcherWithTyping
+      ? core.channel.reply.createReplyDispatcherWithTyping({
+          deliver: async (payload: unknown) => {
+            await deliver(payload as { text?: string; mediaUrl?: string; mediaUrls?: string[] });
+          },
+          humanDelay,
+          onError: (err: unknown, info: { kind: string }) => {
+            error(`[dingtalk] ${info.kind} reply failed: ${String(err)}`);
+          },
+        })
+      : {
+          dispatcher: core.channel.reply.createReplyDispatcher?.({
+            deliver: async (payload: unknown) => {
+              await deliver(payload as { text?: string; mediaUrl?: string; mediaUrls?: string[] });
+            },
+            humanDelay,
+            onError: (err: unknown, info: { kind: string }) => {
+              error(`[dingtalk] ${info.kind} reply failed: ${String(err)}`);
+            },
+          }),
+          replyOptions: {},
+          markDispatchIdle: () => undefined,
+        };
+
+    if (!dispatcherResult.dispatcher) {
+      log(`[dingtalk] dispatcher not available, skipping dispatch`);
+      return;
+    }
+
     log(`[dingtalk] dispatching to agent (session=${route.sessionKey})`);
-    
+
     // 分发消息
     const { queuedFinal, counts } = await core.channel.reply.dispatchReplyFromConfig({
       ctx: finalCtx,
       cfg,
+      dispatcher: dispatcherResult.dispatcher,
+      replyOptions: dispatcherResult.replyOptions,
     });
-    
+
+    dispatcherResult.markDispatchIdle?.();
+
     log(`[dingtalk] dispatch complete (queuedFinal=${queuedFinal}, replies=${counts.final})`);
   } catch (err) {
     error(`[dingtalk] failed to dispatch message: ${String(err)}`);

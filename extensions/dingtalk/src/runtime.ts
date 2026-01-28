@@ -41,8 +41,26 @@ export interface PluginRuntime {
         replyOptions?: unknown;
       }) => Promise<{ queuedFinal: boolean; counts: { final: number } }>;
       finalizeInboundContext?: (ctx: unknown) => unknown;
+      createReplyDispatcher?: (params: unknown) => unknown;
+      createReplyDispatcherWithTyping?: (params: unknown) => {
+        dispatcher: unknown;
+        replyOptions?: unknown;
+        markDispatchIdle?: () => void;
+      };
+      resolveHumanDelayConfig?: (cfg: unknown, agentId?: string) => unknown;
       resolveEnvelopeFormatOptions?: (cfg: unknown) => unknown;
       formatAgentEnvelope?: (params: unknown) => string;
+    };
+    text?: {
+      resolveTextChunkLimit?: (params: {
+        cfg: unknown;
+        channel: string;
+        defaultLimit?: number;
+      }) => number;
+      resolveChunkMode?: (cfg: unknown, channel: string) => unknown;
+      resolveMarkdownTableMode?: (params: { cfg: unknown; channel: string }) => unknown;
+      convertMarkdownTables?: (text: string, mode: unknown) => string;
+      chunkTextWithMode?: (text: string, limit: number, mode: unknown) => string[];
     };
   };
   system?: {
